@@ -1,0 +1,512 @@
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{needspace}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\newcommand{\ignore}{\texttt{-100}}
+\newcommand{\R}{\mathbb{R}}
+
+\title{Homework 4: Direct Preference Optimization for GPT-2; 11-411/611}
+\date{}
+\author{SGD}
+
+\begin{document}
+\maketitle
+
+\section*{Overview}
+
+In this homework you will implement a simplified \emph{Direct Preference Optimization} (DPO) trainer for GPT-2. The main goal is to make you more independent at building modern NLP training pipelines: loading preference data, preparing causal language-model inputs, computing sequence log-probabilities, implementing the DPO objective, and writing a training loop from scratch.
+
+You may use \texttt{torch} and Hugging Face \emph{model/tokenizer} classes, but you may \textbf{not} use any high-level training wrapper such as \texttt{transformers.Trainer}, \texttt{trl.DPOTrainer}, or any other library that already implements the training objective for you.
+
+This is a \textbf{coding-only} assignment. You only need to implement and submit \texttt{submission.py}; there is no separate written report.
+
+\section*{Learning goals}
+
+By the end of this homework, you should be able to:
+\begin{enumerate}[itemsep=0.25em]
+    \item convert preference triples into causal LM training examples;
+    \item compute token-level and sequence-level log-probabilities correctly;
+    \item implement the DPO loss from its mathematical definition;
+    \item train a policy model against a frozen reference model;
+    \item evaluate preference alignment using a log-probability-based metric.
+\end{enumerate}
+
+\section*{Background}
+
+A preference dataset consists of triples
+\[
+(x, y_w, y_l),
+\]
+where \(x\) is a prompt, \(y_w\) is the \emph{chosen} response, and \(y_l\) is the \emph{rejected} response.
+
+We will train a policy model \(\pi_\theta\) relative to a frozen reference model \(\pi_{\mathrm{ref}}\). For a response \(y = (y_1, \dots, y_T)\), define the response log-probability conditioned on prompt \(x\) as
+\[
+\log \pi_\theta(y \mid x)
+=
+\sum_{t=1}^{T}
+\log \pi_\theta(y_t \mid x, y_{<t}).
+\]
+In this homework, you should compute this quantity over the \emph{response tokens only}, not the prompt tokens.
+
+The DPO objective for one preference pair is
+\[
+\mathcal{L}_{\mathrm{DPO}}
+=
+-\log \sigma\!\left(
+\beta
+\left[
+\bigl(\log \pi_\theta(y_w \mid x) - \log \pi_\theta(y_l \mid x)\bigr)
+-
+\bigl(\log \pi_{\mathrm{ref}}(y_w \mid x) - \log \pi_{\mathrm{ref}}(y_l \mid x)\bigr)
+\right]
+\right),
+\]
+where \(\sigma(\cdot)\) is the logistic sigmoid and \(\beta > 0\) controls how strongly we enforce the preference.
+
+Intuitively, the policy should assign higher relative probability to the chosen response than to the rejected response, but it is anchored by the reference model.
+A deeper derivation of why this loss arises from first principles — including where the \(\beta\) terms come from, why the partition function cancels, and what the gradient is actually doing — is in \hyperref[app:dpo-intuition]{Appendix~A}.
+
+\subsection*{A note on causal LM labels}
+
+For a causal LM, the model predicts token \(t+1\) from positions up to \(t\). If your input sequence is
+\[
+[\text{prompt tokens}, \text{response tokens}, \text{EOS}],
+\]
+then your \texttt{labels} tensor should:
+\begin{itemize}[itemsep=0.25em]
+    \item contain \ignore{} for prompt positions,
+    \item contain the response token IDs and EOS token ID at the response positions,
+    \item contain \ignore{} at any padding positions.
+\end{itemize}
+This means the loss only applies to the response.
+
+\section*{Assignment simplifications}
+
+To keep the assignment focused and manageable, we will make the following simplifications:
+\begin{enumerate}[itemsep=0.25em]
+    \item Single-turn prompts only.
+    \item A standard causal LM interface (GPT-2 family).
+    \item No PPO, no reward model, and no sampling inside the training loop.
+    \item Full-model fine-tuning is fine; parameter-efficient methods are not the point of this homework.
+\end{enumerate}
+
+\section*{Files provided}
+
+You are given the following files:
+\begin{itemize}[itemsep=0.25em]
+    \item \texttt{submission.py}: starter code with TODOs.
+    \item \texttt{train.py}: a runnable training script that calls your implementations.
+    \item \texttt{data.py}: helpers for reading JSONL preference data.
+    \item \texttt{tests\_public/}: local pytest tests you should run before submitting (see \hyperref[sec:running-tests]{Running the public tests}).
+\end{itemize}
+
+\section*{Running the public tests}\label{sec:running-tests}
+
+The \texttt{tests\_public/} directory exercises your \texttt{submission.py} code (masking, collation, log-probabilities, DPO loss, and related helpers).
+\textbf{Always run commands from the assignment root}---the directory that contains \texttt{submission.py}, \texttt{pytest.ini}, and \texttt{tests\_public/} (the same place you run \texttt{train.py}).
+
+\begin{enumerate}[itemsep=0.35em]
+    \item Install Python dependencies, including \texttt{pytest}, e.g.\
+          \texttt{pip install -r requirements.txt} or your course conda/venv setup.
+    \item Run the full public suite. The quiet form is:
+\begin{lstlisting}
+pytest -q tests_public
+\end{lstlisting}
+          This repository also ships \texttt{pytest.ini} with \texttt{testpaths = tests\_public}, so from the assignment root you may equivalently run \texttt{pytest -q}.
+    \item If a test fails, rerun with \texttt{-v} (verbose) or without \texttt{-q} to see tracebacks and assertion messages, e.g.\ \texttt{pytest tests\_public -v}.
+          To run a single file, e.g.\ \texttt{pytest -q tests\_public/test\_public\_dpo\_loss.py}.
+\end{enumerate}
+
+Passing the public tests is required before you rely on training or the autograder; staff may also run additional private tests.
+
+\section*{What you need to implement}
+
+Implement the TODOs in \texttt{submission.py}. Each function below is a self-contained step in the DPO pipeline; they are meant to be implemented in order, as later functions build on earlier ones.
+
+\paragraph{1.\enspace\texttt{build\_lm\_sequence}}
+Concatenate prompt and response token IDs into a single causal LM training example.
+The returned \texttt{labels} must contain \ignore{} at every prompt position so that the
+loss is computed only over the response.
+When the combined sequence exceeds \texttt{max\_length}, truncate the \emph{prompt} from the
+left rather than the response, and always ensure the sequence ends with EOS.
+
+\paragraph{2.\enspace\texttt{tokenize\_preference\_example}}
+Tokenize one \texttt{\{"prompt", "chosen", "rejected"\}} record.
+Apply \texttt{format\_prompt} to the raw prompt string, tokenize each field separately with
+the provided length budgets, and call \texttt{build\_lm\_sequence} for both the chosen and
+rejected responses.
+Return the four lists: \texttt{chosen\_input\_ids}, \texttt{chosen\_labels},
+\texttt{rejected\_input\_ids}, \texttt{rejected\_labels}.
+
+\paragraph{3.\enspace\texttt{preference\_collate\_fn}}
+Collate a list of tokenized examples into a padded batch.
+A helper stub \texttt{\_pad\_sequences(sequences, *, pad\_value)} is declared in
+\texttt{submission.py} for you to implement: given a list of variable-length integer
+sequences it should return a padded \texttt{LongTensor} of shape \texttt{[batch, max\_len]}
+and a matching \texttt{attention\_mask} tensor.
+Once implemented, call it separately for \texttt{input\_ids} (pad with \texttt{pad\_token\_id})
+and \texttt{labels} (pad with \ignore{}) so that each field receives the correct pad value.
+
+\paragraph{4.\enspace\texttt{sequence\_logps\_from\_logits}}
+Compute one scalar log-probability per sequence from causal-LM logits and labels.
+Properly align logits and labels for next-token prediction, ignore masked positions, and
+either sum or average the per-token log-probabilities over the response positions depending on
+the \texttt{average\_log\_prob} flag.
+
+\paragraph{5.\enspace\texttt{dpo\_loss}}
+Implement the per-example DPO loss exactly as stated in the Background section.
+In addition to the loss tensor, return a \texttt{stats} dict containing detached tensors:
+\texttt{chosen\_rewards}, \texttt{rejected\_rewards}, \texttt{margins}, and \texttt{accuracy}.
+
+\paragraph{6.\enspace\texttt{compute\_dpo\_batch}}
+Run the policy and reference models on one batch, extract sequence log-probabilities for
+all four forward passes (policy chosen, policy rejected, reference chosen, reference rejected),
+and return the mean DPO loss and aggregated metrics.
+Only the policy model should participate in gradient tracking.
+
+\paragraph{7.\enspace\texttt{train\_step}}
+Perform one gradient update: zero gradients, call \texttt{compute\_dpo\_batch},
+backpropagate, optionally clip gradients, and step the optimizer.
+Return a dict of Python floats with at least \texttt{loss}, \texttt{preference\_accuracy},
+and \texttt{mean\_margin}.
+
+\paragraph{8.\enspace\texttt{evaluate\_preference\_accuracy}}
+Iterate over a full dataloader, accumulate metrics across all batches without tracking
+gradients, and return their averages as Python floats.
+
+\subsection*{Implementation hints}
+
+These hints point out non-obvious pitfalls; they do not tell you \emph{how} to implement each function.
+
+\begin{itemize}[itemsep=0.45em]
+    \item \textbf{Causal shift.}
+    A causal LM's logit at position $t$ predicts token $t+1$.
+    Before you look up log-probabilities using your label values, think carefully about
+    which positions in the logits tensor actually correspond to which labels.
+
+    \item \textbf{Prompt truncation direction.}
+    When the prompt must be shortened to make room for the response, consider \emph{which
+    end} carries the information most relevant to the next token.
+
+    \item \textbf{Attention mask and the EOS token.}
+    GPT-2 reuses the EOS token as its pad token.
+    A mask built by comparing token IDs against \texttt{pad\_token\_id} will silently
+    mark the legitimate EOS at the end of every real sequence as padding.
+    Think about when you have the ground-truth sequence length available.
+
+    \item \textbf{Gradient scope.}
+    The reference model must stay frozen throughout training.
+    One context manager in PyTorch is designed exactly for this; applying it to the right
+    forward pass will prevent any gradient from flowing into the reference model's parameters.
+
+    \item \textbf{Implicit rewards.}
+    The ``chosen reward'' and ``rejected reward'' statistics you return from \texttt{dpo\_loss}
+    are not free-standing scalars you need to compute separately---they fall directly out of
+    quantities you already have at that point.  Re-read the DPO loss formula in ratio form
+    (Appendix~A, Eq.~A.3) for a nudge.
+
+    \item \textbf{Reducing log-probs to a scalar.}
+    \texttt{sequence\_logps\_from\_logits} must return one number per sequence.
+    Before calling \texttt{dpo\_loss}, double-check that your tensor has shape
+    \texttt{[batch]} and not \texttt{[batch, seq\_len]}.
+\end{itemize}
+
+\section*{Dataset}
+
+For the real experiment, use the course-provided JSONL subset:
+\begin{lstlisting}
+data/uf_small_train.jsonl
+data/uf_small_val.jsonl
+data/uf_small_test.jsonl
+\end{lstlisting}
+
+Each row has the form
+\begin{lstlisting}
+{"prompt": "...", "chosen": "...", "rejected": "..."}
+\end{lstlisting}
+
+This subset is derived from \texttt{HuggingFaceH4/ultrafeedback\_binarized}. We provide a subset rather than the full source dataset so that:
+\begin{itemize}[itemsep=0.25em]
+    \item you do not spend your time on dataset cleaning,
+    \item everyone trains on the same size budget,
+    \item the default setup fits comfortably in a standard Colab workflow.
+\end{itemize}
+
+\paragraph{Suggested defaults.}
+A good default configuration is:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Model & \texttt{gpt2} \\
+\(\beta\) & \(0.1\) \\
+Max prompt tokens & \(96\) \\
+Max response tokens & \(64\) \\
+Max total length & \(160\) \\
+Batch size & \(4\) \\
+Gradient accumulation & \(4\) \\
+Learning rate & \(1\times 10^{-5}\) \\
+Epochs & \(1\) or \(2\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Why default to one epoch?}
+The provided subset is small, and DPO updates the full policy on every preference pair each epoch.
+One epoch keeps runtime and memory pressure modest (including Colab) while still showing a clear preference-accuracy trend; training longer can yield slightly better alignment but also risks overfitting this slice of UltraFeedback.
+You are welcome to train for two epochs if you have the time and want to explore the trade-off.
+
+\paragraph{Training command.}
+From the assignment root (the directory that contains \texttt{train.py} and the \texttt{data/} folder), run:
+\begin{lstlisting}
+python train.py \
+  --train_path data/uf_small_train.jsonl \
+  --val_path data/uf_small_val.jsonl \
+  --output_dir outputs/hw4_dpo \
+  --model_name gpt2 \
+  --beta 0.1 \
+  --max_prompt_length 96 \
+  --max_response_length 64 \
+  --max_length 160 \
+  --batch_size 4 \
+  --grad_accum_steps 4 \
+  --learning_rate 1e-5 \
+  --epochs 1 \
+  --seed 13
+\end{lstlisting}
+This matches the suggested defaults in the table (including gradient clipping at \texttt{train.py}'s default of \texttt{1.0}). For a second epoch, set \texttt{-{}-epochs 2}. The trained policy and tokenizer are written to \texttt{outputs/hw4\_dpo/policy\_model}; metrics are saved as \texttt{outputs/hw4\_dpo/metrics.json}.
+
+\paragraph{Running the training loop (recommended for exposure).}
+Your grade comes from the autograder on \texttt{submission.py}; you are not required to train to full convergence for credit. Even so, we strongly encourage you to run \texttt{train.py} at least once on your own machine or Colab: it is the most direct way to see how your DPO implementation behaves in practice---validation metrics, saved \texttt{metrics.json}, and the printed greedy completions let you compare the \textbf{policy} after updates to the frozen \textbf{reference} and get a feel for whether preference alignment is moving in the right direction.
+
+\paragraph{Trying other base models.}
+The table defaults to \texttt{gpt2} for speed and modest memory. If you have headroom, try other Hugging Face causal language models (e.g.\ \texttt{distilgpt2}, \texttt{gpt2-medium}) by changing \texttt{-{}-model\_name}. Larger models train more slowly and may need a smaller batch size or shorter max lengths to fit in memory.
+
+\paragraph{Logging and sample generations.}
+\texttt{train.py} prints a few greedy-decoded completions after each epoch, comparing the \textbf{reference} model (frozen at initialization) to the \textbf{policy} after training so far.
+Prompts are drawn from the validation JSONL with a fixed shuffle controlled by \texttt{-{}-seed}.
+
+\paragraph{Weights~\&~Biases (optional).}
+Optional \href{https://wandb.ai}{Weights~\&~Biases} logging: each epoch records validation metrics and a table \texttt{epoch/generations} (prompt, reference, policy).
+The \texttt{wandb} package is listed in \texttt{requirements.txt}; omit the \texttt{-{}-wandb\_project} and \texttt{-{}-wandb\_run\_name} arguments if you do not want W\&B.
+
+{\footnotesize
+From the assignment root (the directory that contains \texttt{train.py} and \texttt{data/}), run the following as a single shell command (it may wrap across lines in this PDF).
+The first time you use W\&B on a laptop, follow any authentication prompt from the client.
+
+\Needspace{14\baselineskip}
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize,breaklines=true,frame=single,columns=fullflexible]
+python train.py --train_path data/uf_small_train.jsonl --val_path data/uf_small_val.jsonl --output_dir outputs/hw4_dpo --model_name gpt2 --beta 0.1 --max_prompt_length 96 --max_response_length 64 --max_length 160 --batch_size 4 --grad_accum_steps 4 --learning_rate 1e-5 --epochs 1 --seed 13 --wandb_project nlp-hw4-dpo --wandb_run_name my-dpo-run
+\end{lstlisting}
+
+\medskip
+\noindent\textbf{Clusters and batch jobs.} In the \emph{same} shell before training, set your API key, then run the same command as above:
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize,breaklines=true,frame=single,columns=fullflexible]
+export WANDB_API_KEY="paste-your-key-here"
+\end{lstlisting}
+The \texttt{wandb} client reads \texttt{WANDB\_API\_KEY} automatically; you do not need to change \texttt{train.py}.
+Rename \texttt{nlp-hw4-dpo} or \texttt{my-dpo-run} if you prefer different project or run names.
+}
+
+\section*{Implementation rules}
+
+\begin{itemize}[itemsep=0.35em]
+    \item You may use \texttt{torch}, \texttt{transformers} model/tokenizer classes, and ordinary optimizer utilities.
+    \item You may \textbf{not} use \texttt{transformers.Trainer}, \texttt{trl}, \texttt{trl.DPOTrainer}, or any package that already implements DPO training for you.
+    \item Your reference model must remain frozen.
+    \item Your code should be vectorized where possible.
+    \item Your public and private tests should pass without editing the test files.
+\end{itemize}
+
+\section*{Evaluation}
+
+Your homework will be evaluated entirely by the autograder:
+
+\begin{enumerate}[itemsep=0.5em]
+    \item \textbf{Public tests} (local): masking, padding, log-probabilities, and DPO loss.
+    \item \textbf{Private function tests}: additional edge cases and training-step checks.
+    \item \textbf{Private end-to-end test}: a hidden miniature training run compares your implementation against a staff reference on preference-alignment metrics.
+\end{enumerate}
+
+\paragraph{Hidden end-to-end metric.}
+On a hidden miniature preference dataset, the autograder will initialize a tiny causal LM, run your training loop for a fixed small number of updates, and compute preference accuracy:
+\[
+\frac{1}{N}
+\sum_{i=1}^{N}
+\mathbf{1}
+\Bigl[
+(\log \pi_\theta(y_w^{(i)} \mid x^{(i)}) - \log \pi_\theta(y_l^{(i)} \mid x^{(i)}))
+>
+(\log \pi_{\mathrm{ref}}(y_w^{(i)} \mid x^{(i)}) - \log \pi_{\mathrm{ref}}(y_l^{(i)} \mid x^{(i)}))
+\Bigr].
+\]
+Your score will be based on how closely your result matches the staff implementation.
+
+\section*{Submission checklist}
+
+Submit:
+\begin{enumerate}[itemsep=0.25em]
+    \item \texttt{submission.py}
+\end{enumerate}
+
+This is a coding-only assignment. Submit \texttt{submission.py} to Gradescope; all other grading will be handled automatically by the autograder.
+
+Before submitting, make sure you can run (see \hyperref[sec:running-tests]{Running the public tests}):
+\begin{lstlisting}
+pytest -q tests_public
+python train.py --help
+\end{lstlisting}
+and that the training command in the \textbf{Dataset} section completes without errors.
+
+\section*{Common pitfalls}\label{sec:common-pitfalls}
+
+\begin{itemize}[itemsep=0.35em]
+    \item \textbf{Forgetting the causal shift.} Sequence log-probabilities must be computed from shifted logits and shifted labels.
+    \item \textbf{Scoring the prompt.} Only response tokens should contribute to the LM objective.
+    \item \textbf{Incorrect padding masks.} If you use GPT-2, it is common to set \texttt{pad\_token = eos\_token}; your attention mask should therefore be built from sequence lengths, not from token equality checks.
+    \item \textbf{Updating the reference model.} It should stay frozen.
+    \item \textbf{Using a high-level trainer.} The point of this assignment is to write the pipeline yourself.
+\end{itemize}
+
+\section*{Citations}
+
+\begin{itemize}[itemsep=0.25em]
+    \item Rafailov et al., \emph{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}.
+    \item Cui et al., \emph{UltraFeedback: Boosting Language Models with High-quality Feedback}.
+\end{itemize}
+
+\newpage
+\appendix
+\section*{Appendix: Intuition for DPO}\label{app:dpo-intuition}
+
+\subsection*{A.1\quad Why skip the reward model?}
+
+The standard RLHF pipeline has two stages: (1) fit a scalar reward model \(r(x,y)\) from human preference labels, then (2) run reinforcement learning to find a policy with high reward while staying close to a reference model.  DPO collapses both stages into a single supervised loss.  To see why this is possible, start with the KL-penalized reward-maximization objective:
+\begin{equation*}\tag{A.1}
+\max_{\pi_\theta}\;
+\mathbb{E}_{x \sim \mathcal{D},\; y \sim \pi_\theta(\cdot \mid x)}
+\bigl[r(x,y)\bigr]
+\;-\;
+\beta\, D_{\mathrm{KL}}\!\bigl[\pi_\theta(y \mid x) \;\|\; \pi_{\mathrm{ref}}(y \mid x)\bigr].
+\end{equation*}
+The first term wants high reward; the second term keeps the policy close to the reference.  This objective has a closed-form solution:
+\begin{equation*}\tag{A.2}
+\pi^*(y \mid x)
+=
+\frac{1}{Z(x)}\,
+\pi_{\mathrm{ref}}(y \mid x)\,
+\exp\!\left(\frac{r(x,y)}{\beta}\right),
+\quad
+Z(x) = \sum_{y} \pi_{\mathrm{ref}}(y \mid x)\exp\!\left(\frac{r(x,y)}{\beta}\right).
+\end{equation*}
+Equation~(A.2) says the optimal policy is just the reference model \emph{reweighted} by the exponentiated reward.  Responses with higher reward get a larger multiplicative boost; \(Z(x)\) is a prompt-level normalization constant that ensures the probabilities sum to 1.
+
+\subsection*{A.2\quad Reward as a log-probability ratio}
+
+Rearranging (A.2) to isolate \(r\) gives:
+\begin{equation*}\tag{A.3}
+r(x, y)
+=
+\beta \log \frac{\pi^*(y \mid x)}{\pi_{\mathrm{ref}}(y \mid x)}
++
+\beta \log Z(x).
+\end{equation*}
+This is the key insight.  \emph{Up to a prompt-specific constant \(\beta \log Z(x)\), the reward of a response equals how much more likely it is under the optimal policy than under the reference model.}  We do not need an explicit reward model; the policy's own probabilities encode the reward implicitly.
+
+\subsection*{A.3\quad The partition function cancels}
+
+The Bradley--Terry model assigns probability to the preference \(y_w \succ y_l\) as
+\begin{equation*}\tag{A.4}
+p(y_w \succ y_l \mid x)
+= \sigma\!\bigl(r(x, y_w) - r(x, y_l)\bigr).
+\end{equation*}
+Substituting (A.3) into (A.4), the term \(\beta \log Z(x)\) appears in both \(r(x, y_w)\) and \(r(x, y_l)\) and therefore \emph{cancels}:
+\begin{align*}\tag{A.5}
+r(x, y_w) - r(x, y_l)
+&= \beta\log\frac{\pi_\theta(y_w\mid x)}{\pi_{\mathrm{ref}}(y_w\mid x)}
+  - \beta\log\frac{\pi_\theta(y_l\mid x)}{\pi_{\mathrm{ref}}(y_l\mid x)}.
+\end{align*}
+We never need to compute or estimate \(Z(x)\).  Maximum-likelihood training on the preference labels therefore gives the DPO objective:
+\begin{equation*}\tag{A.6}
+\mathcal{L}_{\mathrm{DPO}}
+= -\log\sigma\!\left(
+    \beta\!\left[
+      \log\frac{\pi_\theta(y_w\mid x)}{\pi_{\mathrm{ref}}(y_w\mid x)}
+      -
+      \log\frac{\pi_\theta(y_l\mid x)}{\pi_{\mathrm{ref}}(y_l\mid x)}
+    \right]
+  \right),
+\end{equation*}
+which is exactly the DPO loss in the Background section written in ratio form.
+
+\subsection*{A.4\quad What the gradient is doing}
+
+Define the \emph{implicit reward difference} for a pair as
+\[
+\hat{r}_\theta(x, y_w, y_l)
+=
+\beta\!\left[
+  \log\frac{\pi_\theta(y_w\mid x)}{\pi_{\mathrm{ref}}(y_w\mid x)}
+  -
+  \log\frac{\pi_\theta(y_l\mid x)}{\pi_{\mathrm{ref}}(y_l\mid x)}
+\right].
+\]
+The gradient of \(\mathcal{L}_{\mathrm{DPO}}\) with respect to \(\theta\) is
+\begin{equation*}\tag{A.7}
+-\beta\,
+\bigl(1 - \sigma(\hat{r}_\theta)\bigr)
+\bigl[
+  \nabla_\theta \log\pi_\theta(y_w\mid x)
+  -
+  \nabla_\theta \log\pi_\theta(y_l\mid x)
+\bigr].
+\end{equation*}
+This has two parts:
+\begin{itemize}[itemsep=0.3em]
+  \item The direction \([\nabla_\theta \log\pi_\theta(y_w\mid x) - \nabla_\theta \log\pi_\theta(y_l\mid x)]\) always pushes the winner up and the loser down.
+  \item The scalar weight \((1 - \sigma(\hat{r}_\theta))\) is large when the model is ``wrong'' (i.e., \(\hat{r}_\theta\) is small or negative, meaning the model currently ranks the rejected response too highly) and small when the model is already correct.  DPO thus concentrates its updates on the pairs it currently gets most wrong.
+\end{itemize}
+
+\subsection*{A.5\quad Plain-language summary}
+
+\begin{quote}
+\textbf{Intuition for DPO.}\enspace
+Direct Preference Optimization avoids the usual two-stage RLHF pipeline of first learning a reward model and then optimizing it with reinforcement learning.
+Instead, it exploits the fact that under a KL-constrained objective the optimal policy can be written as the reference policy reweighted by reward (Eq.~A.2).
+This means that, up to a prompt-specific constant, the reward of a response is equivalent to how much more likely that response is under the learned policy than under the reference model (Eq.~A.3).
+Since the Bradley--Terry preference model depends only on \emph{reward differences} between two responses, the prompt-specific constant cancels (Eq.~A.5), and DPO can train the policy directly on preference pairs without fitting a separate reward model or running RL.
+The update is strongest when the model currently assigns too much implicit reward to the rejected response (Eq.~A.7), making DPO a simple and stable way to fine-tune a model from preference data.
+\end{quote}
+
+\noindent A one-line summary: \textbf{DPO = pairwise logistic regression over responses, where the ``score'' is the model's log-probability gain over the reference model.}
+
+\section*{Gradescope submission}
+
+Submit your work on Gradescope. For this coding-only assignment, the only file you need to upload is \texttt{submission.py}; everything else will be handled for you. The autograder will run the public and private tests and assign your marks automatically.
+
+\end{document}
