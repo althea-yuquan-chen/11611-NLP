@@ -1,7 +1,23 @@
-*.txt
-
+# Python
+__pycache__/
+*.pyc
+*.pyo
 .venv/
+*.egg-info/
 
-*.bin
-*.zip
-*.gz
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+__MACOSX/
+.DS_Store
+
+# Testing
+.pytest_cache/
+
+# Large data/model files
+*.txt.gz
+glove*.txt
+
+# Editors
+.vscode/
